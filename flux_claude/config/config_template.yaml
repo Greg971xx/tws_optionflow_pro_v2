@@ -1,0 +1,33 @@
+# Configuration for SPX Options Flow Collector
+# Copy this file to config.yaml and adjust settings
+
+# Database settings
+db_path: "db/multi_expiry_flow.db"
+
+# Interactive Brokers connection
+host: "127.0.0.1"
+port: 7497  # TWS Paper: 7497, TWS Live: 7496, Gateway Paper: 4002, Gateway Live: 4001
+client_id: 14
+connection_timeout: 30.0
+retry_attempts: 3
+
+# Symbol and exchange
+symbol: "SPX"
+exchange: "CBOE"
+option_exchange: "CBOE"
+
+# Multi-expiry analysis settings
+max_dte: 5  # Analyze 1DTE to 5DTE
+n_strikes_per_expiry: 20  # Number of strikes per expiry
+strike_spacing: 5  # Strike spacing (e.g., 5 points)
+atm_range_pct: 0.05  # Focus on ±5% around spot
+
+# Performance settings
+batch_size: 150
+batch_timeout: 3.0
+log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+health_check_interval: 45.0
+
+# Market analysis settings
+min_spread_pct: 0.001  # 0.1% minimum spread
+aggressive_threshold: 0.8  # Confidence threshold for aggressive detection
