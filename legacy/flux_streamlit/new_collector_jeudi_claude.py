@@ -1,11 +1,13 @@
 # =============================================
 # File: collector_lundi.py
-# Purpose: Fixed version - Collect SPX(/SPXW) options ticks + Greeks into SQLite avec volume *réaliste*
+# Purpose: Fixed version - Collect SPX(/SPXW) options ticks + Greeks + Open Interest into SQLite avec volume *réaliste*
 # Fixes:
 #   - Better expiration date logic (avoid same-day expirations)
 #   - Improved spot price detection
 #   - Better error handling for contract qualification
 #   - Added debugging for contract resolution
+#   - Added open interest collection
+#   - Increased strikes to 30
 # =============================================
 
 # --- S'assurer qu'une boucle asyncio existe avant d'importer ib_insync/eventkit ---
@@ -64,7 +66,7 @@ def setup_logging(level: str = "INFO"):
 # ------------- Config model ----------------
 @dataclass
 class Config:
-    db_path: str = "db/optionflow.db"
+    db_path: str = r"C:\Users\decle\PycharmProjects\flux_claude\db\optionflow.db"
     host: str = "127.0.0.1"
     port: int = 7497
     client_id: int = 40
@@ -72,12 +74,13 @@ class Config:
     exchange_index: str = "CBOE"  # index exchange preference
     option_exchange: str = "CBOE"  # options exchange
     trading_class: Optional[str] = None  # "SPX" (monthly) ou "SPXW" (weeklies). None -> auto selon le jour.
-    expiry: str = "20250918"  # "YYYYMMDD" ou "auto"
-    n_strikes: int = 30  # total strikes autour de l'ATM
+    expiry: str = "20251002"  # "YYYYMMDD" ou "auto"
+    n_strikes: int = 30  # total strikes autour de l'ATM (augmenté à 30)
     throttle_ms: int = 400  # ms mini entre deux writes sur un même contrat
     log_level: str = "INFO"
-    spot_fallback: float = 6600  # Updated default fallback
+    spot_fallback: float = 6700  # Updated default fallback
     probe_option_for_spot: bool = True
+    oi_update_interval: int = 3600  # Intervalle de mise à jour OI en secondes (1h par défaut)
 
 
 def load_config_from_yaml(path: Optional[str]) -> Config:
@@ -131,6 +134,8 @@ CREATE TABLE IF NOT EXISTS trades (
     theta REAL,
     -- Trade size réaliste (stocké aussi dans qty pour compat)
     trade_qty INTEGER,
+    -- Open Interest
+    open_interest INTEGER,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 """
@@ -141,6 +146,11 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol);",
 ]
 
+# Index créé après migration des colonnes
+INDEXES_POST_MIGRATION = [
+    "CREATE INDEX IF NOT EXISTS idx_trades_oi ON trades(open_interest);",
+]
+
 GREEKS_COLS = [
     ("iv", "REAL"),
     ("delta", "REAL"),
@@ -148,6 +158,7 @@ GREEKS_COLS = [
     ("vega", "REAL"),
     ("theta", "REAL"),
     ("trade_qty", "INTEGER"),
+    ("open_interest", "INTEGER"),  # Ajout de l'open interest
 ]
 
 
@@ -158,14 +169,22 @@ def ensure_db(db_path: str):
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
         conn.execute(DDL_TRADES)
+
+        # Créer les index de base (sans open_interest)
         for idx in INDEXES:
             conn.execute(idx)
-        # migrations douces
+
+        # migrations douces pour les colonnes
         cur = conn.execute("PRAGMA table_info(trades);")
         existing = {row[1] for row in cur.fetchall()}
         for col, typ in GREEKS_COLS:
             if col not in existing:
                 conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {typ};")
+
+        # Créer les index qui dépendent des nouvelles colonnes
+        for idx in INDEXES_POST_MIGRATION:
+            conn.execute(idx)
+
         conn.commit()
     finally:
         conn.close()
@@ -268,8 +287,8 @@ class BatchWriter:
             INSERT INTO trades (
                 ts, expiry, right, strike, last, bid, ask, qty, volume, spot,
                 estimation, confidence, mid, spread, signed_qty, symbol, trading_class, contract_local,
-                iv, delta, gamma, vega, theta, trade_qty
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                iv, delta, gamma, vega, theta, trade_qty, open_interest
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """
         try:
             conn.executemany(sql, rows)
@@ -414,7 +433,7 @@ class Collector:
         except Exception as e:
             self.log.error(f"Error processing strikes: {e}")
 
-        # Choisir n_strikes autour de l'ATM
+        # Choisir n_strikes autour de l'ATM (maintenant 30)
         chosen = self._select_strikes(strikes, spot)
         self.log.info(f"Selected {len(chosen)} strikes around spot {spot}: {chosen}")
 
@@ -541,12 +560,8 @@ class Collector:
         self.connect()
         expiry, tclass, contracts = self.build_universe()
 
-        # snapshot initial
-        try:
-            self.ib.reqTickers(*contracts)
-            self.ib.sleep(0.5)
-        except Exception:
-            pass
+        # snapshot initial + collecte OI initiale
+        self._collect_open_interest_snapshot(contracts)
 
         # flux live
         subscribed_count = 0
@@ -558,9 +573,19 @@ class Collector:
                 self.log.debug(f"reqMktData live failed for {c}: {e}")
 
         self.log.info(f"Streaming {subscribed_count} contracts... (Ctrl+C to stop)")
+        last_oi_update = time.time()
+
         try:
             while True:
                 self.ib.waitOnUpdate(timeout=1.0)
+
+                # Mise à jour périodique de l'OI selon la configuration
+                current_time = time.time()
+                if current_time - last_oi_update > self.cfg.oi_update_interval:
+                    self.log.info(f"Updating open interest data (interval: {self.cfg.oi_update_interval}s)...")
+                    self._collect_open_interest_snapshot(contracts)
+                    last_oi_update = current_time
+
                 for t in list(self.ib.tickers()):
                     if not t or not t.contract:
                         continue
@@ -574,6 +599,23 @@ class Collector:
                     self.ib.disconnect()
             except Exception:
                 pass
+
+    def _collect_open_interest_snapshot(self, contracts: List[Option]):
+        """Collecte un snapshot de l'open interest pour tous les contrats"""
+        self.log.info(f"Collecting open interest snapshot for {len(contracts)} contracts...")
+        try:
+            # Demander un snapshot pour récupérer l'OI
+            tickers = self.ib.reqTickers(*contracts)
+            self.ib.sleep(2.0)  # Attendre que les données arrivent
+
+            oi_count = 0
+            for t in tickers:
+                if t and hasattr(t, 'openInterest') and t.openInterest is not None:
+                    oi_count += 1
+
+            self.log.info(f"Open interest data available for {oi_count}/{len(contracts)} contracts")
+        except Exception as e:
+            self.log.error(f"Failed to collect open interest snapshot: {e}")
 
     def _maybe_store_tick(self, t, expiry: str, tclass: str):
         c = t.contract
@@ -592,6 +634,9 @@ class Collector:
         ask = _as_float(getattr(t, "ask", None))
         lastSize = _as_int(getattr(t, "lastSize", None))
         volume = _as_int(getattr(t, "volume", None))
+
+        # Récupération de l'open interest
+        open_interest = _as_int(getattr(t, "openInterest", None))
 
         # --- trade size réaliste ---
         trade_qty = 0
@@ -625,12 +670,12 @@ class Collector:
             theta = _as_float(getattr(mg, "theta", None))
         spot_live = _as_float(getattr(mg, "undPrice", None)) if mg else None
 
-        # signature pour éviter doublons
-        sig = (last, bid, ask, volume, iv, gamma, delta, vega, theta, trade_qty)
+        # signature pour éviter doublons - inclure open_interest dans la signature
+        sig = (last, bid, ask, volume, iv, gamma, delta, vega, theta, trade_qty, open_interest)
         if sig == st.last_sig:
             return
 
-        # INSERT: qty == trade_qty (compat app)
+        # INSERT: qty == trade_qty (compat app) + open_interest
         row = (
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             str(expiry),
@@ -651,7 +696,8 @@ class Collector:
             tclass,
             getattr(c, "localSymbol", None),
             iv, delta, gamma, vega, theta,
-            int(trade_qty or 0)  # trade_qty
+            int(trade_qty or 0),  # trade_qty
+            int(open_interest or 0)  # open_interest
         )
         self.writer.add(row)
         st.last_sig = sig
@@ -691,7 +737,7 @@ def _as_int(x):
 # -------------- main -----------------
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Collect SPX(/SPXW) options ticks with Greeks into SQLite (realistic volumes)")
+        description="Collect SPX(/SPXW) options ticks with Greeks and Open Interest into SQLite (realistic volumes)")
     p.add_argument("--config", help="YAML config path")
     p.add_argument("--db", dest="db_path")
     p.add_argument("--host")
@@ -707,6 +753,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log-level")
     p.add_argument("--spot-fallback", type=float, dest="spot_fallback")
     p.add_argument("--no-probe-option", action="store_true", help="Disable option probe for spot")
+    p.add_argument("--oi-update-interval", type=int, dest="oi_update_interval",
+                   help="Open interest update interval in seconds")
     return p.parse_args()
 
 
@@ -725,6 +773,7 @@ def merge_cli(cfg: Config, ns: argparse.Namespace) -> Config:
     if ns.log_level: cfg.log_level = ns.log_level
     if ns.spot_fallback: cfg.spot_fallback = ns.spot_fallback
     if ns.no_probe_option: cfg.probe_option_for_spot = False
+    if ns.oi_update_interval: cfg.oi_update_interval = ns.oi_update_interval
     return cfg
 
 
