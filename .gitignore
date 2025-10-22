@@ -26,3 +26,41 @@ Thumbs.db
 # Autres fichiers sensibles/temp
 *.bak
 *.tmp
+
+# === Refactoring cleanup ===
+# Debug & Profiling
+profile_*.txt
+profile_*.zip
+check_*.py
+estimation.py
+
+# Archives temporaires
+_archive_*/
+db/archives/
+
+# Backups
+*.backup_*
+
+# PyCharm
+.idea/
+*.iml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Logs
+logs/*.log
+*.log
+
+# Environment
+.env
+.venv/
+venv/
+ENV/
