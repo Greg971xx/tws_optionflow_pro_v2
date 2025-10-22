@@ -1,7 +1,0 @@
-Collecting plotly
-  Using cached plotly-6.3.0-py3-none-any.whl.metadata (8.5 kB)
-Requirement already satisfied: narwhals>=1.15.1 in c:\users\decle\pycharmprojects\flux_claude\.venv\lib\site-packages (from plotly) (2.3.0)
-Requirement already satisfied: packaging in c:\users\decle\pycharmprojects\flux_claude\.venv\lib\site-packages (from plotly) (25.0)
-Using cached plotly-6.3.0-py3-none-any.whl (9.8 MB)
-Installing collected packages: plotly
-Successfully installed plotly-6.3.0

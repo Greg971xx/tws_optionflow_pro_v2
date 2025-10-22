@@ -1,7 +1,0 @@
-Collecting scipy
-  Downloading scipy-1.16.1-cp311-cp311-win_amd64.whl.metadata (60 kB)
-Requirement already satisfied: numpy<2.6,>=1.25.2 in c:\users\decle\pycharmprojects\flux_claude\.venv\lib\site-packages (from scipy) (2.3.2)
-Downloading scipy-1.16.1-cp311-cp311-win_amd64.whl (38.6 MB)
-   ---------------------------------------- 38.6/38.6 MB 22.3 MB/s eta 0:00:00
-Installing collected packages: scipy
-Successfully installed scipy-1.16.1
